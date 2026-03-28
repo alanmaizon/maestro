@@ -41,11 +41,24 @@ yarn-error.log*
 *.tsbuildinfo
 next-env.d.ts
 
-# python alignment service
-services/alignment/.venv/
-services/alignment/__pycache__/
+# python
+__pycache__/
 *.pyc
 *.pyo
+*.pyd
+.venv/
+venv/
+env/
+.Python
+*.egg-info/
+*.egg
+dist/
+build/
+*.whl
+*.so
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
 
 # OS
 .DS_Store
