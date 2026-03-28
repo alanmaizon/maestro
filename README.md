@@ -1,36 +1,60 @@
-This is a [Next.js](https://nextjs.org) project bootstrapped with [`create-next-app`](https://nextjs.org/docs/app/api-reference/cli/create-next-app).
+# Maestro
 
-## Getting Started
+AI song generator — Next.js frontend + Gemini/Lyria generation + WhisperX lyric alignment.
 
-First, run the development server:
+## Getting started
 
 ```bash
+cp .env.example .env.local
+# add your GEMINI_API_KEY to .env.local
+npm install
 npm run dev
-# or
-yarn dev
-# or
-pnpm dev
-# or
-bun dev
 ```
 
-Open [http://localhost:3000](http://localhost:3000) with your browser to see the result.
+Open [http://localhost:3000](http://localhost:3000).
 
-You can start editing the page by modifying `app/page.tsx`. The page auto-updates as you edit the file.
+### Optional: alignment service
 
-This project uses [`next/font`](https://nextjs.org/docs/app/building-your-application/optimizing/fonts) to automatically optimize and load [Geist](https://vercel.com/font), a new font family for Vercel.
+The alignment service enables real synced lyrics. Without it, lyrics display in unsynced mode (clean text, no playback-follow highlighting).
 
-## Learn More
+```bash
+cd services/alignment
+python -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+uvicorn main:app --port 8090
+```
 
-To learn more about Next.js, take a look at the following resources:
+See [services/alignment/README.md](services/alignment/README.md) for details.
 
-- [Next.js Documentation](https://nextjs.org/docs) - learn about Next.js features and API.
-- [Learn Next.js](https://nextjs.org/learn) - an interactive Next.js tutorial.
+## Environment
 
-You can check out [the Next.js GitHub repository](https://github.com/vercel/next.js) - your feedback and contributions are welcome!
+| Variable | Description |
+|---|---|
+| `GEMINI_API_KEY` | Google Gemini API key — never exposed to the client |
+| `ALIGNMENT_SERVICE_URL` | Optional, default `http://localhost:8090` |
 
-## Deploy on Vercel
+## How synced lyrics work
 
-The easiest way to deploy your Next.js app is to use the [Vercel Platform](https://vercel.com/new?utm_medium=default-template&filter=next.js&utm_source=create-next-app&utm_campaign=create-next-app-readme) from the creators of Next.js.
+1. **Generate**: the Next.js route calls Lyria, saves the audio to a temp file
+2. **Align**: the route calls the Python alignment service (`POST /align-lyrics`) with the audio path + raw lyrics
+3. **WhisperX**: the service transcribes the audio, aligns words, and matches them to lyric lines
+4. **Validate**: both the aligner and the frontend validate timing quality (monotonicity, min count, confidence)
+5. **Display**: if validation passes → `synced` mode (active line highlight, auto-scroll, click-to-seek). Otherwise → `unsynced` mode (clean static text, no fake sync)
 
-Check out our [Next.js deployment documentation](https://nextjs.org/docs/app/building-your-application/deploying) for more details.
+Current limitation: line-level sync only (not word-level karaoke).
+
+## Stack
+
+- **Next.js 16** (App Router) + **TypeScript** + **Tailwind CSS v4**
+- **@google/genai** — Gemini / Lyria (server-side)
+- **shadcn/ui** + **lucide-react**
+- **FastAPI** + **WhisperX** — alignment service (Python)
+
+## Scripts
+
+| Command | Description |
+|---|---|
+| `npm run dev` | Start dev server |
+| `npm run build` | Production build |
+| `npm run lint` | ESLint |
