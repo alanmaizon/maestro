@@ -11,7 +11,14 @@ npm run lint     # ESLint
 npx tsc --noEmit # standalone type check without building
 ```
 
-Alignment service (optional, enables synced lyrics):
+Orchestrator service (runs the song pipeline and future workflows):
+```bash
+cd services/orchestrator
+pip install -r requirements.txt
+uvicorn server.app:app --port 8100
+```
+
+Alignment service (called by orchestrator, enables synced lyrics):
 ```bash
 cd services/alignment
 source .venv/bin/activate
@@ -20,22 +27,59 @@ uvicorn main:app --port 8090
 
 ## Architecture
 
-**Maestro** is an AI song generator. The Next.js route generates songs via Gemini/Lyria, then calls a Python alignment service for real lyric timing. No auth, no database.
+**Maestro** is an AI song generator built on a multi-agent orchestration layer. The Next.js frontend calls the Maestro orchestrator, which coordinates agents and tools (Gemini/Lyria for generation, WhisperX for alignment) through inspectable workflow runs. No auth, no database.
+
+### Orchestration layer
+
+The orchestrator (`services/orchestrator/`) is a Python service that coordinates multi-step workflows:
+
+- **Agents** — role-bounded workers (generator, aligner, packager) that call tools
+- **Tools** — typed capabilities (generate_audio, align_lyrics, package_result)
+- **Workflows** — DAGs of steps with dependencies, retries, output schemas, and approval gates
+- **Conductor** — the engine that walks the DAG, dispatches tasks, enforces policy, validates outputs, handles failures
+- **Policy** — rules layer: tool access per agent, max tool calls per task, approval rules for actions
+- **Schema validation** — each step can declare required output keys + types; malformed outputs fail fast with `validation.failed` events
+- **Runs** — execution instances with full event timeline and task state
 
 ### Generation + alignment flow
 
-1. `POST /api/generate-song` → Lyria generates audio + lyrics text
-2. Route saves audio to temp file on disk
-3. Route calls `POST http://localhost:8090/align-lyrics` with audio path + lyrics text
-4. Python service (WhisperX) transcribes audio → aligns words → maps to lyric lines → returns `LyricSync`
-5. Route returns `{ title, lyricsOrStructure, lyricSync, audioBase64, audioMimeType }`
-6. If alignment service is down or fails, `lyricSync.mode` is `"unsynced"` — song still works, just without sync
+1. `POST /api/generate-song` → Next.js route calls orchestrator `POST /runs`
+2. Orchestrator starts `song_pipeline` workflow with three steps:
+   - `generate` — agent calls Gemini/Lyria → returns audio + lyrics
+   - `align` — agent saves audio to temp, calls WhisperX alignment service → returns `LyricSync`
+   - `package` — agent assembles final `GeneratedResult` from upstream outputs
+3. Orchestrator returns run with outputs; Next.js route extracts and returns to frontend
+4. Every step, tool call, and handoff is logged as events on the run
+5. If alignment fails, `lyricSync.mode` is `"unsynced"` — song still works, just without sync
+
+### Orchestrator API
+
+| Endpoint | Method | Purpose |
+|---|---|---|
+| `/runs` | POST | Start a workflow run |
+| `/runs` | GET | List all runs |
+| `/runs/{id}` | GET | Run detail (tasks, events, outputs) |
+| `/runs/{id}/events` | GET | Event timeline |
+| `/runs/{id}/approve` | POST | Approve a pending approval gate |
+| `/workflows` | GET | List registered workflows |
+| `/agents` | GET | List registered agents |
+| `/tools` | GET | List registered tools |
+| `/health` | GET | Health check |
 
 ### Key files
 
 | File | Role |
 |---|---|
-| `app/api/generate-song/route.ts` | Server route: Lyria call → save audio to temp → call aligner → return result |
+| `app/api/generate-song/route.ts` | Thin proxy: calls orchestrator `POST /runs` → returns packaged result |
+| `services/orchestrator/core/models.py` | Domain models: Agent, Task, Workflow, Run, Event, Policy |
+| `services/orchestrator/core/conductor.py` | Orchestration engine: DAG walker, retries, approval gates, event logging |
+| `services/orchestrator/core/registry.py` | Agent and Tool registries |
+| `services/orchestrator/tools/generate_audio.py` | Tool: calls Gemini/Lyria for audio generation |
+| `services/orchestrator/tools/align_lyrics.py` | Tool: saves temp audio, calls alignment service |
+| `services/orchestrator/tools/package_result.py` | Tool: assembles final GeneratedResult |
+| `services/orchestrator/workflows/song_pipeline.py` | Workflow definition: generate → align → package |
+| `services/orchestrator/server/app.py` | FastAPI server: runs, events, approvals, introspection |
+| `services/orchestrator/app_factory.py` | Wires conductor with all agents, tools, and workflows |
 | `services/alignment/main.py` | FastAPI + WhisperX: `POST /align-lyrics` → `{ mode, reason, lines[], warnings[] }` |
 | `app/page.tsx` | Page state — idle / loading / error / generated |
 | `components/song-result.tsx` | Owns `<audio>` ref shared by player, waveform, visualizer, and lyrics |

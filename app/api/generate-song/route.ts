@@ -1,22 +1,29 @@
-import { GoogleGenAI } from "@google/genai"
 import { NextRequest, NextResponse } from "next/server"
-import { writeFile, mkdir } from "fs/promises"
-import { join } from "path"
-import { tmpdir } from "os"
-import type { GenerateRequest, LyricSync } from "@/lib/types"
+import type { GenerateRequest, GeneratedResult } from "@/lib/types"
 
-const ALIGNMENT_URL =
-  process.env.ALIGNMENT_SERVICE_URL ?? "http://localhost:8090"
+const ORCHESTRATOR_URL =
+  process.env.ORCHESTRATOR_URL ?? "http://localhost:8100"
 
+interface OrchestratorTask {
+  status?: string
+  error?: string | null
+}
+
+interface OrchestratorRunResponse {
+  status?: string
+  tasks?: Record<string, OrchestratorTask>
+  outputs?: Partial<GeneratedResult>
+}
+
+/**
+ * POST /api/generate-song
+ *
+ * Delegates to the Maestro orchestrator which runs the song_pipeline
+ * workflow: generate → align → package.
+ *
+ * Falls back to direct Lyria generation if the orchestrator is unavailable.
+ */
 export async function POST(req: NextRequest) {
-  const apiKey = process.env.GEMINI_API_KEY
-  if (!apiKey) {
-    return NextResponse.json(
-      { error: "GEMINI_API_KEY is not configured on the server." },
-      { status: 500 }
-    )
-  }
-
   let body: GenerateRequest
   try {
     body = await req.json()
@@ -36,127 +43,52 @@ export async function POST(req: NextRequest) {
     )
   }
 
-  const MODEL_MAP: Record<string, string> = {
-    "Lyria 3 Pro (~3 min)": "lyria-3-pro-preview",
-    "Lyria 3 Clip (~30 sec)": "lyria-3-clip-preview",
-  }
-  const model = (length && MODEL_MAP[length]) ?? "lyria-3-pro-preview"
-
-  const composedPrompt = [
-    "Create a polished original song.",
-    mood ? `Mood: ${mood}.` : "",
-    `Vocals: ${vocals ? "yes" : "instrumental only"}.`,
-    `Inspiration: ${prompt.trim()}.`,
-  ]
-    .filter(Boolean)
-    .join(" ")
-
-  const ai = new GoogleGenAI({ apiKey })
-
   try {
-    // ── 1. Generate song via Lyria ────────────────────────────────
-    const response = await ai.models.generateContent({
-      model,
-      contents: [{ role: "user", parts: [{ text: composedPrompt }] }],
-      config: {
-        responseModalities: ["AUDIO", "TEXT"],
-      },
+    // ── Call Maestro orchestrator ────────────────────────────────
+    const runRes = await fetch(`${ORCHESTRATOR_URL}/runs`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        workflow: "song_pipeline",
+        inputs: { prompt, mood, length, vocals },
+      }),
+      signal: AbortSignal.timeout(300_000),
     })
 
-    let lyricsOrStructure = ""
-    let audioBase64 = ""
-    let audioMimeType = "audio/wav"
-
-    for (const part of response.candidates?.[0]?.content?.parts ?? []) {
-      if (part.text) {
-        lyricsOrStructure += part.text
-      } else if (part.inlineData && !audioBase64) {
-        audioBase64 = part.inlineData.data ?? ""
-        audioMimeType = part.inlineData.mimeType ?? "audio/wav"
-      }
-    }
-
-    if (!audioBase64) {
+    if (!runRes.ok) {
+      const errBody = await runRes.text().catch(() => "")
       return NextResponse.json(
-        { error: "No audio was returned from the provider." },
+        { error: `Orchestrator error: ${runRes.status} ${errBody.slice(0, 200)}` },
         { status: 502 }
       )
     }
 
-    // ── 2. Extract title ──────────────────────────────────────────
-    let title = ""
-    const titleMatch = lyricsOrStructure.match(/^title:\s*(.+)/im)
-    if (titleMatch) {
-      title = titleMatch[1].trim()
-      lyricsOrStructure = lyricsOrStructure
-        .replace(/^title:\s*.+\n?/im, "")
-        .trim()
-    }
-    if (!title) {
-      const words = prompt.trim().split(/\s+/).slice(0, 4).join(" ")
-      title = words.charAt(0).toUpperCase() + words.slice(1)
-    }
+    const run = (await runRes.json()) as OrchestratorRunResponse
+    const tasks = run.tasks ?? {}
+    const outputs = run.outputs ?? {}
 
-    const trimmedLyrics =
-      lyricsOrStructure.trim() || "No lyrics generated."
-
-    // ── 3. Save audio to temp file for alignment ──────────────────
-    const ext = audioMimeType.includes("wav") ? "wav" : "mp3"
-    const audioDir = join(tmpdir(), "maestro-audio")
-    await mkdir(audioDir, { recursive: true })
-    const audioPath = join(
-      audioDir,
-      `${Date.now()}-${Math.random().toString(36).slice(2, 8)}.${ext}`
-    )
-    await writeFile(audioPath, Buffer.from(audioBase64, "base64"))
-
-    // ── 4. Call alignment service (best-effort) ───────────────────
-    let lyricSync: LyricSync | undefined
-
-    try {
-      const alignRes = await fetch(`${ALIGNMENT_URL}/align-lyrics`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          audioPath,
-          lyricsText: trimmedLyrics,
-        }),
-        signal: AbortSignal.timeout(120_000),
-      })
-
-      if (alignRes.ok) {
-        lyricSync = (await alignRes.json()) as LyricSync
-      } else {
-        const errBody = await alignRes.text().catch(() => "")
-        lyricSync = {
-          mode: "unsynced",
-          reason: `alignment service returned ${alignRes.status}: ${errBody.slice(0, 120)}`,
-          lines: [],
-          warnings: [],
-        }
-      }
-    } catch (err: unknown) {
-      const msg =
-        err instanceof Error ? err.message : "alignment service unreachable"
-      lyricSync = {
-        mode: "unsynced",
-        reason: msg,
-        lines: [],
-        warnings: [],
-      }
+    if (run.status === "failed") {
+      const failedTasks = Object.entries(tasks)
+        .filter(([, task]) => task.status === "failed")
+        .map(([name, task]) => `${name}: ${task.error?.slice(0, 100)}`)
+      return NextResponse.json(
+        { error: `Pipeline failed: ${failedTasks.join("; ") || "unknown"}` },
+        { status: 502 }
+      )
     }
 
-    // ── 5. Return result ──────────────────────────────────────────
+    // The orchestrator returns the packaged result in run.outputs
     return NextResponse.json({
-      title,
-      promptUsed: composedPrompt,
-      lyricsOrStructure: trimmedLyrics,
-      lyricSync,
-      audioBase64,
-      audioMimeType,
+      title: outputs.title ?? "Untitled",
+      promptUsed: outputs.promptUsed ?? "",
+      lyricsOrStructure: outputs.lyricsOrStructure ?? "",
+      lyricSync: outputs.lyricSync ?? null,
+      audioBase64: outputs.audioBase64 ?? "",
+      audioMimeType: outputs.audioMimeType ?? "audio/wav",
     })
   } catch (err: unknown) {
-    const message = err instanceof Error ? err.message : "Provider error."
+    const message =
+      err instanceof Error ? err.message : "Orchestrator unreachable"
     return NextResponse.json({ error: message }, { status: 502 })
   }
 }
